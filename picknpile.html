@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pick'n Pile</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #e8eaf2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  canvas { display: block; cursor: pointer; border-radius: 4px; }
+  #wrapper { position: relative; }
+
+  .overlay {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    background: rgba(255,255,255,0.97);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+    padding: 40px 52px;
+    z-index: 10;
+    min-width: 300px;
+  }
+  .overlay h1 { font-size: 26px; font-weight: 800; color: #222; margin-bottom: 6px; }
+  .overlay h2 { font-size: 22px; font-weight: 700; color: #e44; margin-bottom: 16px; }
+  .overlay .sub { font-size: 13px; color: #666; margin: 6px 0; line-height: 1.6; }
+  .overlay .hint { font-size: 12px; color: #888; margin-top: 16px; }
+  .overlay .score-line { font-size: 15px; font-weight: 600; color: #333; margin: 6px 0; }
+
+  button {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    background: #5b6af8;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 26px;
+    cursor: pointer;
+    margin: 6px 5px 0;
+    transition: background 0.15s;
+  }
+  button:hover { background: #4452e0; }
+  button.secondary { background: #888; }
+  button.secondary:hover { background: #666; }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="wrapper">
+  <canvas id="game"></canvas>
+
+  <div id="menu" class="overlay">
+    <h1>Pick'n Pile</h1>
+    <p class="sub" style="margin-bottom:12px; color:#5b6af8; font-weight:600;">Classic puzzle game</p>
+    <p class="sub">Select an object, then click another cell to swap them.</p>
+    <p class="sub">Fill a column with same-color balls touching the ground to clear it!</p>
+    <p class="hint">Space = drop a ball &nbsp;·&nbsp; Enter = drop 3 &nbsp;·&nbsp; P = pause</p>
+    <div style="margin-top:20px;">
+      <button id="btnEasy">Easy — Level 1</button>
+      <button id="btnHard" class="secondary">Hard — Level 50</button>
+    </div>
+  </div>
+
+  <div id="gameover" class="overlay hidden">
+    <h2>Game Over</h2>
+    <p class="score-line" id="goScore"></p>
+    <p class="score-line" id="goLevel"></p>
+    <button id="btnRestart" style="margin-top:20px;">Play Again</button>
+  </div>
+</div>
+
+<script>
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const CELL_SIZE  = 36;
+const HUD_HEIGHT = 60;
+const BAR_HEIGHT = 44;
+const GRID_PAD   = 14;
+
+const BG_COLOR        = '#f0f1f8';
+const GRID_BG         = '#ffffff';
+const GRID_LINE_COLOR = '#e0e2ee';
+const GROUND_COLOR    = '#c8cad8';
+const HUD_FONT        = 'system-ui, -apple-system, sans-serif';
+
+const BALL_COLORS = {
+  red:    '#e84040',
+  blue:   '#3a8ef6',
+  yellow: '#f5c200',
+  green:  '#2ecc71',
+};
+const BALL_LIGHT = {
+  red:    '#ff7070',
+  blue:   '#7db8ff',
+  yellow: '#ffe76a',
+  green:  '#7aeba5',
+};
+
+const COLUMN_TRANSPARENT = new Set(['bonusPoints','multiplier','hourglass','diamond']);
+const ANIM_DURATION = { clear: 150, explode: 200, diamond: 350, fall: 140 };
+const DIAMOND_THRESHOLD    = 1000;
+const HOURGLASS_TIME_BONUS = 200;
+const DIAMOND_CAPACITY     = 10;
+
+// ─── LEVEL CONFIG ─────────────────────────────────────────────────────────────
+function getLevelConfig(level) {
+  // Fixed 20×8 board (like the original game), difficulty scales via ball count & hazards
+  const BASE = { cols: 20, rows: 8 };
+  if (level <= 10) return {
+    ...BASE, colors: ['red','blue','yellow'], time: 120,
+    ballCount: 36 + level * 2,   // level 1 ≈ 38, level 10 ≈ 56  (~2–3 per column)
+    hazards: ['wall'],
+    bonusChance: 0.06,
+  };
+  if (level <= 25) return {
+    ...BASE, colors: ['red','blue','yellow'], time: 100,
+    ballCount: 55 + level,       // level 11 ≈ 66, level 25 ≈ 80
+    hazards: ['wall','skull'],
+    bonusChance: 0.07,
+  };
+  if (level <= 49) return {
+    ...BASE, colors: ['red','blue','yellow'], time: 80,
+    ballCount: 80 + level,       // level 26 ≈ 106, level 49 ≈ 129
+    hazards: ['wall','skull','bomb'],
+    bonusChance: 0.08,
+  };
+  return {
+    ...BASE, colors: ['red','blue','yellow','green'], time: 60,
+    ballCount: 130 + Math.min(level - 50, 20),
+    hazards: ['wall','skull','bomb','flame','flowerPot'],
+    bonusChance: 0.1,
+  };
+}
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let state, grid, COLS, ROWS, canvas, ctx;
+
+function createCell(type, color = null, value = null) {
+  return { type, color, value, selected: false };
+}
+
+const EXTRA_LIFE_EVERY = 100000; // 1 extra life per 100 000 pts (original game)
+
+function nextLifeThreshold(score, awarded) {
+  return EXTRA_LIFE_EVERY * (awarded + 1);
+}
+
+function checkExtraLife() {
+  while (state.score >= state.nextLifeScore) {
+    state.lives++;
+    state.extraLivesAwarded++;
+    state.scorePopups.push({
+      text: '♥ Extra Life!',
+      x: canvas.width / 2,
+      y: canvas.height / 2,
+      timer: 1600,
+    });
+    state.nextLifeScore = nextLifeThreshold(state.score, state.extraLivesAwarded);
+  }
+}
+
+function initLevel(level, lives, score, diamonds, extraLives) {
+  const cfg = getLevelConfig(level);
+  COLS = cfg.cols;
+  ROWS = cfg.rows;
+
+  canvas.width  = GRID_PAD * 2 + COLS * CELL_SIZE;
+  canvas.height = HUD_HEIGHT + ROWS * CELL_SIZE + BAR_HEIGHT;
+
+  grid = Array.from({ length: COLS }, () => Array(ROWS).fill(null));
+
+  const currentScore = score || 0;
+  state = {
+    phase: 'playing',
+    level,
+    score: currentScore,
+    lives: lives !== undefined ? lives : 3,
+    timeLeft: cfg.time,
+    timeMultiplier: 1.0,
+    selectedCell: null,
+    diamondStore: diamonds || [],
+    animations: [],
+    fallingCells: [],
+    scorePopups: [],
+    skullsOnGround: 0,
+    nextLifeScore: nextLifeThreshold(currentScore, extraLives || 0),
+    extraLivesAwarded: extraLives || 0,
+  };
+
+  populateGrid(cfg);
+  applyGravity();
+  breakPreformedColumns(cfg.colors);
+}
+
+// ─── GRID POPULATION ─────────────────────────────────────────────────────────
+function populateGrid(cfg) {
+  // Fill columns from the ground up, always placing in the shortest column(s).
+  // This guarantees adjacent columns differ by at most 1 in height.
+  const heights = Array(COLS).fill(0);
+  const total = Math.min(cfg.ballCount, COLS * ROWS);
+
+  for (let i = 0; i < total; i++) {
+    const minH = Math.min(...heights);
+    if (minH >= ROWS) break;
+    // Collect all columns at the minimum height and pick one at random
+    const candidates = [];
+    for (let c = 0; c < COLS; c++)
+      if (heights[c] === minH) candidates.push(c);
+    const col = candidates[Math.floor(Math.random() * candidates.length)];
+    const row = heights[col];
+    grid[col][row] = createCell('ball', cfg.colors[Math.floor(Math.random() * cfg.colors.length)]);
+    heights[col]++;
+  }
+
+  // Scatter bonus tiles: replace a random non-ground ball cell with a bonus
+  const bonusPool = ['bonusPoints','multiplier','hourglass'];
+  const bonusCount = Math.round(total * cfg.bonusChance);
+  const filledAboveGround = [];
+  for (let c = 0; c < COLS; c++)
+    for (let r = 1; r < heights[c]; r++)
+      if (grid[c][r]?.type === 'ball') filledAboveGround.push([c, r]);
+  shuffle(filledAboveGround);
+  for (let b = 0; b < bonusCount && b < filledAboveGround.length; b++) {
+    const [c, r] = filledAboveGround[b];
+    const btype = bonusPool[Math.floor(Math.random() * bonusPool.length)];
+    const val = btype === 'bonusPoints' ? [100,200,500][Math.floor(Math.random()*3)]
+              : btype === 'multiplier'  ? [2,3,6][Math.floor(Math.random()*3)]
+              : null;
+    grid[c][r] = createCell(btype, null, val);
+  }
+
+  // Place hazards on top of existing columns (above current height, not touching ground)
+  const hazardCols = Array.from({length: COLS}, (_, i) => i);
+  shuffle(hazardCols);
+  let hci = 0;
+  for (const htype of cfg.hazards) {
+    const count = 1 + Math.floor(Math.random() * 2);
+    for (let h = 0; h < count; h++, hci++) {
+      if (hci >= COLS) break;
+      const col = hazardCols[hci % COLS];
+      const r = heights[col];
+      if (r < ROWS) {
+        grid[col][r] = createCell(htype);
+        heights[col]++;
+      }
+    }
+  }
+}
+
+// After gravity settles, break any column that would immediately clear
+function breakPreformedColumns(colors) {
+  for (let col = 0; col < COLS; col++) {
+    if (!grid[col][0]) continue;
+    const topRow = getTopRow(col);
+    if (topRow < 0) continue;
+    const cells = [];
+    for (let row = 0; row <= topRow; row++)
+      if (grid[col][row]) cells.push({ cell: grid[col][row], row });
+    if (cells.length < 2) continue;
+    if (!isColumnClearable(cells)) continue;
+
+    // Scramble: pick the ball farthest from ground and change its color
+    const ballCells = cells.filter(c => c.cell.type === 'ball');
+    if (ballCells.length === 0) continue;
+    const target = ballCells[ballCells.length - 1].cell;
+    const others = colors.filter(c => c !== target.color);
+    if (others.length > 0)
+      target.color = others[Math.floor(Math.random() * others.length)];
+  }
+}
+
+// ─── GRAVITY ─────────────────────────────────────────────────────────────────
+
+// Vertical only — straight-down fall, no lateral sliding.
+function applyVerticalGravity() {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let col = 0; col < COLS; col++) {
+      for (let row = 1; row < ROWS; row++) {
+        const cell = grid[col][row];
+        if (!cell) continue;
+        if (!grid[col][row - 1]) {
+          if (cell.type === 'flowerPot') {
+            for (let r = 0; r < row; r++) grid[col][r] = null;
+          }
+          grid[col][row - 1] = cell;
+          grid[col][row] = null;
+          changed = true;
+        }
+      }
+    }
+  }
+}
+
+// Lateral slide only — a ball slides diagonally into a neighbour column
+// that is 2+ rows lower. Re-settles vertically after each slide.
+function applyLateralPass() {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let col = 0; col < COLS; col++) {
+      for (let row = 1; row < ROWS; row++) {
+        const cell = grid[col][row];
+        if (!cell || cell.type === 'wall' || cell.type === 'flowerPot') continue;
+        if (grid[col][row - 1] !== null) {
+          const dirs = Math.random() < 0.5 ? [-1, 1] : [1, -1];
+          for (const dir of dirs) {
+            const nc = col + dir;
+            if (nc < 0 || nc >= COLS) continue;
+            if (grid[nc][row] === null && grid[nc][row - 1] === null) {
+              grid[nc][row - 1] = cell;
+              grid[col][row] = null;
+              changed = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (changed) applyVerticalGravity();
+  }
+}
+
+// Full gravity: vertical then lateral. Used for initLevel only.
+function applyGravity() {
+  applyVerticalGravity();
+  applyLateralPass();
+  updateSkullGround();
+}
+
+function updateSkullGround() {
+  state.skullsOnGround = 0;
+  for (let col = 0; col < COLS; col++)
+    if (grid[col][0]?.type === 'skull') state.skullsOnGround++;
+  state.timeMultiplier = state.skullsOnGround > 0 ? 2.0 : 1.0;
+}
+
+// ─── COLUMN CHECK ─────────────────────────────────────────────────────────────
+function isBall(cell) { return cell?.type === 'ball'; }
+
+function getTopRow(col) {
+  for (let r = ROWS - 1; r >= 0; r--)
+    if (grid[col][r]) return r;
+  return -1;
+}
+
+function isColumnClearable(cells) {
+  const ballCells = cells.filter(c => isBall(c.cell));
+  const noIntruders = cells.every(c => COLUMN_TRANSPARENT.has(c.cell.type) || isBall(c.cell));
+  if (!noIntruders) return false;
+  if (ballCells.length === 0) return cells.length >= 2;
+  const color = ballCells[0].cell.color;
+  return ballCells.every(c => c.cell.color === color);
+}
+
+function checkColumns() {
+  let anyCleared = false;
+  for (let col = 0; col < COLS; col++) {
+    if (grid[col][0]?.type !== 'ball') continue; // bottom cell must be a ball
+    const topRow = getTopRow(col);
+    if (topRow < 0) continue;
+    const cells = [];
+    for (let row = 0; row <= topRow; row++)
+      if (grid[col][row]) cells.push({ cell: grid[col][row], row });
+    if (cells.length < 2) continue;
+    if (isColumnClearable(cells)) {
+      clearColumn(col, cells);
+      anyCleared = true;
+    }
+  }
+  return anyCleared;
+}
+
+function clearColumn(col, cells) {
+  const result = scoreColumn(cells.map(c => c.cell));
+  state.score += result.points;
+  if (result.addTime) state.timeLeft += result.addTime;
+  checkExtraLife();
+
+  // if this clear contained a diamond object, collect it now
+  for (const c of cells) {
+    if (c.cell.type === 'diamond') collectDiamond(c.cell.value || 1000);
+  }
+
+  // popup at column top
+  const topCell = cells[cells.length - 1];
+  const { x, y } = gridToCanvas(col, topCell.row);
+  state.scorePopups.push({ text: '+' + result.points, x: x + CELL_SIZE / 2, y, timer: 850 });
+
+  cells.forEach(({ row }) => {
+    state.animations.push({ type: 'clear', col, row, timer: ANIM_DURATION.clear });
+    grid[col][row] = null;
+  });
+
+  if (result.awardDiamond) {
+    const topRow = topCell.row + 1;
+    if (topRow < ROWS) {
+      grid[col][topRow] = createCell('diamond', null, result.diamondValue);
+      state.animations.push({ type: 'diamond', col, row: topRow, timer: ANIM_DURATION.diamond });
+    } else {
+      collectDiamond(result.diamondValue); // no room to spawn — collect directly
+    }
+  }
+}
+
+function scoreColumn(cells) {
+  const balls        = cells.filter(c => c.type === 'ball');
+  const bonusPoints  = cells.filter(c => c.type === 'bonusPoints').reduce((s, c) => s + c.value, 0);
+  const multipliers  = cells.filter(c => c.type === 'multiplier').map(c => c.value);
+  const hasHourglass = cells.some(c => c.type === 'hourglass');
+  const diamondBonus = cells.filter(c => c.type === 'diamond').reduce((s, c) => s + (c.value || 1000), 0);
+
+  const n = balls.length;
+  let base = 0;
+  if (n >= 2) base = n === 2 ? 100 : n === 3 ? 300 : n === 4 ? 600 : 600 + (n - 4) * 200;
+
+  let total = base + bonusPoints + diamondBonus;
+  if (multipliers.length > 0) total *= Math.max(...multipliers);
+
+  return {
+    points: total,
+    addTime: hasHourglass ? HOURGLASS_TIME_BONUS : 0,
+    awardDiamond: total > DIAMOND_THRESHOLD,
+    diamondValue: total,
+  };
+}
+
+function collectDiamond(value) {
+  state.diamondStore.push(value || 1000);
+  if (state.diamondStore.length >= DIAMOND_CAPACITY) {
+    const bonus = state.diamondStore.reduce((s, v) => s + v, 0) * 2;
+    state.score += bonus;
+    checkExtraLife();
+    state.diamondStore = [];
+    state.scorePopups.push({
+      text: 'Diamond Bonus +' + bonus.toLocaleString(),
+      x: canvas.width / 2, y: canvas.height / 2 - 20, timer: 1600,
+    });
+  }
+}
+
+function diamondTier(value) {
+  if (value >= 5000) return 'gold';
+  if (value >= 2000) return 'silver';
+  return 'bronze';
+}
+
+// ─── SWAP / INPUT ─────────────────────────────────────────────────────────────
+function handleClick(e) {
+  if (state.phase !== 'playing') return;
+  if (hasActiveAnimations()) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const mx = (e.clientX - rect.left) * scaleX;
+  const my = (e.clientY - rect.top) * scaleY;
+
+  const col = Math.floor((mx - GRID_PAD) / CELL_SIZE);
+  const row = ROWS - 1 - Math.floor((my - HUD_HEIGHT) / CELL_SIZE);
+
+  if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return;
+
+  const clicked = grid[col][row];
+
+  if (!state.selectedCell) {
+    if (!clicked) return;
+    if (clicked.type === 'skull' || clicked.type === 'flowerPot') return;
+    state.selectedCell = { col, row };
+    clicked.selected = true;
+  } else {
+    const sc = state.selectedCell;
+    if (sc.col === col && sc.row === row) {
+      grid[sc.col][sc.row].selected = false;
+      state.selectedCell = null;
+      return;
+    }
+    performSwap(sc, { col, row });
+    state.selectedCell = null;
+  }
+}
+
+function performSwap(a, b) {
+  const cellA = grid[a.col][a.row];
+  const cellB = grid[b.col][b.row];
+  if (cellA) cellA.selected = false;
+
+  if (cellA?.type === 'bomb') {
+    explodeBomb(b.col, b.row);
+    grid[a.col][a.row] = null;
+  } else if (cellB?.type === 'bomb') {
+    explodeBomb(a.col, a.row);
+    grid[b.col][b.row] = null;
+  } else {
+    grid[b.col][b.row] = cellA;
+    grid[a.col][a.row] = cellB;
+  }
+  postSwap();
+}
+
+function explodeBomb(cx, cy) {
+  for (let dc = -1; dc <= 1; dc++) {
+    for (let dr = -1; dr <= 1; dr++) {
+      if (dc === 0 && dr === 0) continue;
+      const c = cx + dc, r = cy + dr;
+      if (c >= 0 && c < COLS && r >= 0 && r < ROWS) {
+        state.animations.push({ type: 'explode', col: c, row: r, timer: ANIM_DURATION.explode });
+        grid[c][r] = null;
+      }
+    }
+  }
+}
+
+function snapshotPositions() {
+  const snap = new Map();
+  for (let c = 0; c < COLS; c++)
+    for (let r = 0; r < ROWS; r++)
+      if (grid[c][r]) snap.set(grid[c][r], gridToCanvas(c, r)); // store {x, y}
+  return snap;
+}
+
+function recordFallAnimations(snap) {
+  for (let c = 0; c < COLS; c++) {
+    for (let r = 0; r < ROWS; r++) {
+      const cell = grid[c][r];
+      if (!cell || !snap.has(cell)) continue;
+      const from = snap.get(cell);
+      const to   = gridToCanvas(c, r);
+      if (from.x !== to.x || from.y !== to.y) {
+        state.fallingCells = state.fallingCells.filter(f => f.cell !== cell);
+        state.fallingCells.push({ cell, fromX: from.x, fromY: from.y, toX: to.x, toY: to.y, timer: ANIM_DURATION.fall });
+      }
+    }
+  }
+}
+
+function postSwap() {
+  let snap, iters;
+
+  // 1. Fall straight down — balls land in their column and can form a column.
+  snap = snapshotPositions();
+  applyVerticalGravity();
+  recordFallAnimations(snap);
+
+  // 2. Column-clear cascade (vertical settle only between clears).
+  iters = 20;
+  while (checkColumns() && iters-- > 0) {
+    snap = snapshotPositions();
+    applyVerticalGravity();
+    recordFallAnimations(snap);
+  }
+
+  // 3. Now apply lateral gravity — balls stranded 2+ rows above a neighbour slide.
+  snap = snapshotPositions();
+  applyLateralPass();
+  recordFallAnimations(snap);
+
+  // 4. Lateral may have built new columns — cascade again.
+  iters = 20;
+  while (checkColumns() && iters-- > 0) {
+    snap = snapshotPositions();
+    applyVerticalGravity();
+    recordFallAnimations(snap);
+
+    // Lateral again after each clear in this phase.
+    snap = snapshotPositions();
+    applyLateralPass();
+    recordFallAnimations(snap);
+  }
+
+  updateSkullGround();
+  if (state.selectedCell) {
+    const { col, row } = state.selectedCell;
+    if (!grid[col][row]) state.selectedCell = null;
+  }
+  checkWin();
+}
+
+// ─── BALL DROP ────────────────────────────────────────────────────────────────
+function findDropTarget(cfg) {
+  const free = [];
+  for (let c = 0; c < COLS; c++)
+    if (getTopRow(c) + 1 < ROWS) free.push(c);
+  if (free.length === 0) return null;
+  const col   = free[Math.floor(Math.random() * free.length)];
+  const color = cfg.colors[Math.floor(Math.random() * cfg.colors.length)];
+  return { col, color };
+}
+
+function dropOneBall() {
+  if (state.phase !== 'playing') return;
+  const cfg = getLevelConfig(state.level);
+  const target = findDropTarget(cfg);
+  if (!target) return;
+
+  const ball = createCell('ball', target.color);
+  const top  = getTopRow(target.col);
+  grid[target.col][top + 1] = ball;
+  postSwap(); // physics settles (ball may slide laterally)
+
+  // Find where ball actually landed and animate it falling straight from above the grid.
+  for (let c = 0; c < COLS; c++) {
+    for (let r = 0; r < ROWS; r++) {
+      if (grid[c][r] === ball) {
+        const { x: toX, y: toY } = gridToCanvas(c, r);
+        state.fallingCells = state.fallingCells.filter(f => f.cell !== ball);
+        state.fallingCells.push({ cell: ball, fromX: toX, fromY: HUD_HEIGHT - CELL_SIZE, toX, toY, timer: ANIM_DURATION.fall });
+        return;
+      }
+    }
+  }
+}
+
+// ─── WIN / LOSE ───────────────────────────────────────────────────────────────
+function countBalls() {
+  let n = 0;
+  for (let c = 0; c < COLS; c++)
+    for (let r = 0; r < ROWS; r++)
+      if (grid[c][r]?.type === 'ball') n++;
+  return n;
+}
+
+function checkWin() {
+  if (countBalls() > 0) return;
+  state.score += Math.floor(state.timeLeft) * state.level * 10;
+  const nextLevel = state.level + 1;
+  state.phase = 'levelComplete';
+  setTimeout(() => initLevel(nextLevel, state.lives, state.score, state.diamondStore, state.extraLivesAwarded), 1800);
+}
+
+function handleTimeout() {
+  state.lives--;
+  if (state.lives <= 0) {
+    state.phase = 'gameOver';
+    document.getElementById('goScore').textContent = 'Score: ' + state.score.toLocaleString();
+    document.getElementById('goLevel').textContent = 'Level reached: ' + state.level;
+    document.getElementById('gameover').classList.remove('hidden');
+  } else {
+    initLevel(state.level, state.lives, state.score, state.diamondStore, state.extraLivesAwarded);
+  }
+}
+
+// ─── ANIMATION ───────────────────────────────────────────────────────────────
+function hasActiveAnimations() { return state.animations.length > 0; }
+
+function updateAnimations(dt) {
+  state.animations  = state.animations.filter(a => { a.timer -= dt; return a.timer > 0; });
+  state.fallingCells = state.fallingCells.filter(f => { f.timer -= dt; return f.timer > 0; });
+  state.scorePopups = state.scorePopups.filter(p => { p.timer -= dt; p.y -= dt * 0.025; return p.timer > 0; });
+}
+
+// ─── RENDER ──────────────────────────────────────────────────────────────────
+function gridToCanvas(col, row) {
+  return {
+    x: GRID_PAD + col * CELL_SIZE,
+    y: HUD_HEIGHT + (ROWS - 1 - row) * CELL_SIZE,
+  };
+}
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // page background
+  ctx.fillStyle = BG_COLOR;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawGrid();
+  drawCells();
+  drawAnimOverlays();
+  drawScorePopups();
+  drawHUD();
+  drawDiamondBar();
+
+  if (state.phase === 'levelComplete') drawLevelBanner();
+  if (state.phase === 'paused')        drawPauseOverlay();
+}
+
+function drawGrid() {
+  // white grid background
+  ctx.fillStyle = GRID_BG;
+  ctx.fillRect(GRID_PAD, HUD_HEIGHT, COLS * CELL_SIZE, ROWS * CELL_SIZE);
+
+  // subtle ground highlight
+  ctx.fillStyle = '#f0f1f8';
+  ctx.fillRect(GRID_PAD, HUD_HEIGHT + (ROWS - 1) * CELL_SIZE, COLS * CELL_SIZE, CELL_SIZE);
+
+  ctx.strokeStyle = GRID_LINE_COLOR;
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) {
+    const x = GRID_PAD + c * CELL_SIZE;
+    ctx.beginPath(); ctx.moveTo(x, HUD_HEIGHT); ctx.lineTo(x, HUD_HEIGHT + ROWS * CELL_SIZE); ctx.stroke();
+  }
+  for (let r = 0; r <= ROWS; r++) {
+    const y = HUD_HEIGHT + r * CELL_SIZE;
+    ctx.beginPath(); ctx.moveTo(GRID_PAD, y); ctx.lineTo(GRID_PAD + COLS * CELL_SIZE, y); ctx.stroke();
+  }
+
+  // ground line emphasis
+  const groundY = HUD_HEIGHT + ROWS * CELL_SIZE;
+  ctx.strokeStyle = GROUND_COLOR;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(GRID_PAD, groundY); ctx.lineTo(GRID_PAD + COLS * CELL_SIZE, groundY); ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+const SPECIAL_COLORS = {
+  wall:       { bg: '#b0b4cc', border: '#8890aa', label: '#fff' },
+  bomb:       { bg: '#ff9040', border: '#cc5500', label: '#fff' },
+  skull:      { bg: '#c060e0', border: '#8030b0', label: '#fff' },
+  flame:      { bg: '#ff5533', border: '#cc2200', label: '#fff' },
+  flowerPot:  { bg: '#c89040', border: '#9a6010', label: '#fff' },
+  bonusPoints:{ bg: '#40d090', border: '#20a060', label: '#fff' },
+  multiplier: { bg: '#f060c0', border: '#c020a0', label: '#fff' },
+  hourglass:  { bg: '#60bce0', border: '#3090c0', label: '#fff' },
+  diamond:    { bg: '#88d0f8', border: '#40a8e8', label: '#fff' },
+};
+
+function drawCells() {
+  for (let col = 0; col < COLS; col++) {
+    for (let row = 0; row < ROWS; row++) {
+      const cell = grid[col][row];
+      if (!cell) continue;
+      const fa = state.fallingCells.find(f => f.cell === cell);
+      let animX = null, animY = null;
+      if (fa) {
+        const progress = 1 - fa.timer / ANIM_DURATION.fall;
+        const eased = progress * progress; // ease-in
+        animX = fa.fromX + (fa.toX - fa.fromX) * eased;
+        animY = fa.fromY + (fa.toY - fa.fromY) * eased;
+      }
+      drawCell(cell, col, row, animY, animX);
+    }
+  }
+}
+
+function drawCell(cell, col, row, animY = null, animX = null) {
+  const { x: gridX, y: gridY } = gridToCanvas(col, row);
+  const x  = animX !== null ? animX : gridX;
+  const y  = animY !== null ? animY : gridY;
+  const cx = x + CELL_SIZE / 2;
+  const cy = y + CELL_SIZE / 2;
+  const r  = CELL_SIZE / 2 - 4;
+
+  if (cell.type === 'ball') {
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.08)';
+    ctx.beginPath();
+    ctx.ellipse(cx + 1, cy + r * 0.6 + 1, r * 0.8, r * 0.25, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // body gradient
+    const grd = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r);
+    grd.addColorStop(0, BALL_LIGHT[cell.color]);
+    grd.addColorStop(1, BALL_COLORS[cell.color]);
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // shine
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(cx - r * 0.28, cy - r * 0.28, r * 0.32, r * 0.2, -0.7, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (cell.selected) {
+      ctx.strokeStyle = '#5b6af8';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(x + 2, y + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+    }
+    return;
+  }
+
+  const theme = SPECIAL_COLORS[cell.type] || { bg: '#ccc', border: '#999', label: '#fff' };
+  const pad = 5;
+
+  // rounded rect background
+  roundRect(ctx, x + pad, y + pad, CELL_SIZE - pad * 2, CELL_SIZE - pad * 2, 4);
+  ctx.fillStyle = theme.bg;
+  ctx.fill();
+  ctx.strokeStyle = theme.border;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // emoji / label
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  let label = '';
+  let fontSize = 20;
+  let useEmoji = true;
+  switch (cell.type) {
+    case 'wall':        label = '▪'; useEmoji = false; fontSize = 22; ctx.fillStyle = theme.label; break;
+    case 'bomb':        label = '💣'; break;
+    case 'skull':       label = '💀'; break;
+    case 'flame':       label = '🔥'; break;
+    case 'flowerPot':   label = '🪴'; break;
+    case 'hourglass':   label = '⏳'; break;
+    case 'diamond': {
+      const tier = diamondTier(cell.value || 1000);
+      // tint the background with tier color
+      roundRect(ctx, x + 5, y + 5, CELL_SIZE - 10, CELL_SIZE - 10, 4);
+      ctx.fillStyle = DIAMOND_TIER_COLOR[tier] + '55';
+      ctx.fill();
+      label = '💎';
+      // small tier indicator
+      ctx.fillStyle = DIAMOND_TIER_COLOR[tier];
+      ctx.font = `bold 7px ${HUD_FONT}`;
+      ctx.fillText(tier.toUpperCase(), cx, cy + 10);
+      break;
+    }
+    case 'bonusPoints':
+      label = '+' + cell.value; useEmoji = false; fontSize = 9;
+      ctx.fillStyle = theme.label;
+      ctx.font = `bold ${fontSize}px ${HUD_FONT}`;
+      ctx.fillText(label, cx, cy);
+      break;
+    case 'multiplier':
+      label = '×' + cell.value; useEmoji = false; fontSize = 11;
+      ctx.fillStyle = theme.label;
+      ctx.font = `bold ${fontSize}px ${HUD_FONT}`;
+      ctx.fillText(label, cx, cy);
+      break;
+  }
+  if (useEmoji && label) {
+    ctx.font = `${fontSize}px sans-serif`;
+    ctx.fillText(label, cx, cy + 1);
+  } else if (!useEmoji && cell.type === 'wall') {
+    ctx.font = `bold ${fontSize}px ${HUD_FONT}`;
+    ctx.fillText(label, cx, cy);
+  }
+
+  if (cell.selected) {
+    ctx.strokeStyle = '#5b6af8';
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(x + 2, y + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+  }
+}
+
+function roundRect(ctx, x, y, w, h, radius) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function drawAnimOverlays() {
+  for (const anim of state.animations) {
+    const { x, y } = gridToCanvas(anim.col, anim.row);
+    const progress = 1 - anim.timer / ANIM_DURATION[anim.type];
+
+    if (anim.type === 'clear') {
+      ctx.fillStyle = `rgba(91,106,248,${(1 - progress) * 0.7})`;
+      ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+    } else if (anim.type === 'explode') {
+      ctx.fillStyle = `rgba(255,120,30,${1 - progress})`;
+      ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+    } else if (anim.type === 'diamond') {
+      const alpha = Math.sin(progress * Math.PI) * 0.5;
+      ctx.fillStyle = `rgba(136,208,248,${alpha})`;
+      ctx.fillRect(x - 3, y - 3, CELL_SIZE + 6, CELL_SIZE + 6);
+    }
+  }
+}
+
+function drawScorePopups() {
+  for (const p of state.scorePopups) {
+    const alpha = Math.min(1, p.timer / 350);
+    ctx.fillStyle = `rgba(50,80,220,${alpha})`;
+    ctx.font = `bold 12px ${HUD_FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(p.text, p.x, p.y);
+  }
+}
+
+function drawHUD() {
+  // background
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, HUD_HEIGHT);
+  ctx.strokeStyle = '#e0e2ee';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, HUD_HEIGHT); ctx.lineTo(canvas.width, HUD_HEIGHT); ctx.stroke();
+
+  ctx.textBaseline = 'middle';
+
+  // lives
+  ctx.fillStyle = '#e84040';
+  ctx.font = `bold 13px ${HUD_FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText('♥ ' + state.lives, 14, 22);
+  ctx.fillStyle = '#aaa';
+  ctx.font = `11px ${HUD_FONT}`;
+  ctx.fillText('Level ' + state.level, 14, 44);
+
+  // score
+  ctx.fillStyle = '#222';
+  ctx.font = `bold 16px ${HUD_FONT}`;
+  ctx.textAlign = 'center';
+  ctx.fillText(state.score.toLocaleString(), canvas.width / 2, 22);
+  ctx.fillStyle = '#aaa';
+  ctx.font = `10px ${HUD_FONT}`;
+  ctx.fillText('score', canvas.width / 2, 42);
+
+  // timer
+  const t = Math.ceil(state.timeLeft);
+  const timerColor = t < 15 ? '#e84040' : state.skullsOnGround > 0 ? '#f5a623' : '#3a8ef6';
+  ctx.fillStyle = timerColor;
+  ctx.font = `bold 16px ${HUD_FONT}`;
+  ctx.textAlign = 'right';
+  ctx.fillText(t + 's', canvas.width - 14, 22);
+  ctx.fillStyle = '#aaa';
+  ctx.font = `10px ${HUD_FONT}`;
+  ctx.fillText(state.skullsOnGround > 0 ? '⚠ skull' : 'time', canvas.width - 14, 42);
+}
+
+const DIAMOND_TIER_COLOR = { bronze: '#c8832a', silver: '#a0b0c8', gold: '#f5c200' };
+
+function drawDiamondBar() {
+  const bx = GRID_PAD;
+  const by = HUD_HEIGHT + ROWS * CELL_SIZE + 8;
+  const bw = COLS * CELL_SIZE;
+  const bh = 20;
+  const count = state.diamondStore.length;
+
+  ctx.fillStyle = '#e8eaf2';
+  roundRect(ctx, bx, by, bw, bh, 4);
+  ctx.fill();
+
+  const segW = bw / DIAMOND_CAPACITY;
+  for (let i = 0; i < count; i++) {
+    const tier = diamondTier(state.diamondStore[i]);
+    roundRect(ctx, bx + i * segW + 1, by + 1, segW - 2, bh - 2, 3);
+    ctx.fillStyle = DIAMOND_TIER_COLOR[tier];
+    ctx.fill();
+    // shine
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(bx + i * segW + 3, by + 3, (segW - 6) * 0.5, 4);
+  }
+
+  ctx.strokeStyle = '#c8cce0';
+  ctx.lineWidth = 1;
+  roundRect(ctx, bx, by, bw, bh, 4);
+  ctx.stroke();
+
+  ctx.fillStyle = '#888';
+  ctx.font = `11px ${HUD_FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('💎 ' + count + ' / ' + DIAMOND_CAPACITY, bx + bw / 2, by + bh + 10);
+}
+
+function drawLevelBanner() {
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fillRect(0, canvas.height / 2 - 44, canvas.width, 88);
+  ctx.fillStyle = '#2ecc71';
+  ctx.font = `bold 20px ${HUD_FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Level Clear!', canvas.width / 2, canvas.height / 2 - 14);
+  ctx.fillStyle = '#5b6af8';
+  ctx.font = `13px ${HUD_FONT}`;
+  ctx.fillText('Time bonus +' + (Math.floor(state.timeLeft) * state.level * 10), canvas.width / 2, canvas.height / 2 + 18);
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#333';
+  ctx.font = `bold 22px ${HUD_FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Paused', canvas.width / 2, canvas.height / 2);
+  ctx.fillStyle = '#888';
+  ctx.font = `13px ${HUD_FONT}`;
+  ctx.fillText('Press P to resume', canvas.width / 2, canvas.height / 2 + 32);
+}
+
+// ─── UTILS ───────────────────────────────────────────────────────────────────
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+// ─── GAME LOOP ────────────────────────────────────────────────────────────────
+let lastTime = 0;
+
+function gameLoop(ts) {
+  const dt = Math.min(ts - lastTime, 50);
+  lastTime = ts;
+
+  if (state && state.phase !== 'gameOver') {
+    updateAnimations(dt);
+    if (state.phase === 'playing') {
+      state.timeLeft -= (dt / 1000) * state.timeMultiplier;
+      if (state.timeLeft <= 0) { state.timeLeft = 0; handleTimeout(); }
+    }
+    try { render(); } catch(e) { console.error('render error:', e); }
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ─── BOOT ─────────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  canvas = document.getElementById('game');
+  ctx    = canvas.getContext('2d');
+
+  COLS = 20; ROWS = 8;
+  canvas.width  = GRID_PAD * 2 + COLS * CELL_SIZE;
+  canvas.height = HUD_HEIGHT + ROWS * CELL_SIZE + BAR_HEIGHT;
+  grid  = Array.from({ length: COLS }, () => Array(ROWS).fill(null));
+  state = {
+    phase: 'menu', score: 0, lives: 3, level: 1, timeLeft: 120,
+    timeMultiplier: 1, selectedCell: null, diamondStore: [],
+    animations: [], fallingCells: [], scorePopups: [], skullsOnGround: 0,
+    nextLifeScore: EXTRA_LIFE_EVERY, extraLivesAwarded: 0,
+  };
+
+  canvas.addEventListener('click', handleClick);
+
+  let dropInterval = null;
+  function startDropping() {
+    if (dropInterval) return;
+    dropOneBall();
+    dropInterval = setInterval(dropOneBall, 65);
+  }
+  function stopDropping() {
+    if (dropInterval) { clearInterval(dropInterval); dropInterval = null; }
+  }
+
+  document.addEventListener('keydown', e => {
+    if (!state) return;
+    if (e.key === 'p' || e.key === 'P') {
+      if (state.phase === 'playing') state.phase = 'paused';
+      else if (state.phase === 'paused') state.phase = 'playing';
+    }
+    if (e.key === ' ') { e.preventDefault(); dropOneBall(); }
+    if (e.key === 'Enter') { e.preventDefault(); if (!e.repeat) startDropping(); }
+  });
+  document.addEventListener('keyup', e => {
+    if (e.key === 'Enter') stopDropping();
+  });
+
+  document.getElementById('btnEasy').addEventListener('click', () => {
+    document.getElementById('menu').classList.add('hidden');
+    initLevel(1);
+  });
+  document.getElementById('btnHard').addEventListener('click', () => {
+    document.getElementById('menu').classList.add('hidden');
+    initLevel(50);
+  });
+  document.getElementById('btnRestart').addEventListener('click', () => {
+    document.getElementById('gameover').classList.add('hidden');
+    document.getElementById('menu').classList.remove('hidden');
+  });
+
+  requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(gameLoop); });
+});
+</script>
+</body>
+</html>
